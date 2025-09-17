@@ -1,0 +1,7 @@
+[theme]
+# 🎨 Tema oficial inspirado no TJ Rondônia
+primaryColor = "#1e3a8a"         # Azul institucional (botões, sliders, checkboxes)
+backgroundColor = "#ffffff"      # Fundo claro (mais legível em telão)
+secondaryBackgroundColor = "#f3f4f6"  # Painéis, sidebars: cinza claro elegante
+textColor = "#111827"            # Texto preto/cinza escuro (contraste alto)
+font = "sans serif"              # Fonte profissional e clean
