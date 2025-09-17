@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from io import BytesIO
+import sqlite3
 from datetime import datetime
+import os
 
 st.set_page_config(
     page_title="Matriz GUT 2.0 - Votação Colaborativa",
@@ -59,82 +60,249 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ===================== ESTADOS =====================
-if 'modo' not in st.session_state: st.session_state.modo = 'selecao'
-if 'problemas_cadastrados' not in st.session_state: st.session_state.problemas_cadastrados = []
-if 'votos' not in st.session_state: st.session_state.votos = {}
-if 'participante_id' not in st.session_state: st.session_state.participante_id = None
-if 'admin_logado' not in st.session_state: st.session_state.admin_logado = False
+# ===================== BANCO DE DADOS =====================
+DATABASE_FILE = 'matriz_gut.db'
 
-# ===================== FUNÇÕES =====================
-def gerar_id_problema(nome): 
-    return nome.lower().replace(' ', '_')[:20]
-
-def adicionar_problema_admin(nome, descricao=""):
-    pid = gerar_id_problema(nome)
-    st.session_state.problemas_cadastrados.append({
-        "id": pid, 
-        "nome": nome, 
-        "descricao": descricao, 
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    })
-    if pid not in st.session_state.votos: 
-        st.session_state.votos[pid] = []
-
-def votar_problema(pid, participante, g, u, t):
-    voto = {
-        "participante": participante, 
-        "gravidade": g, 
-        "urgencia": u, 
-        "tendencia": t, 
-        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    if pid not in st.session_state.votos: 
-        st.session_state.votos[pid] = []
+def init_database():
+    """Inicializa o banco de dados SQLite"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
     
-    # Atualizar voto existente ou adicionar novo
-    for i, v in enumerate(st.session_state.votos[pid]):
-        if v['participante'] == participante:
-            st.session_state.votos[pid][i] = voto
-            return
-    st.session_state.votos[pid].append(voto)
+    # Tabela de problemas
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS problemas (
+            id TEXT PRIMARY KEY,
+            nome TEXT NOT NULL,
+            descricao TEXT,
+            timestamp TEXT
+        )
+    ''')
+    
+    # Tabela de votos
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS votos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            problema_id TEXT,
+            participante TEXT,
+            gravidade INTEGER,
+            urgencia INTEGER,
+            tendencia INTEGER,
+            timestamp TEXT,
+            UNIQUE(problema_id, participante),
+            FOREIGN KEY (problema_id) REFERENCES problemas (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
-def calcular_medias(pid):
-    votos = st.session_state.votos.get(pid, [])
-    if not votos: return None
-    n = len(votos)
-    g = sum(v['gravidade'] for v in votos) / n
-    u = sum(v['urgencia'] for v in votos) / n
-    t = sum(v['tendencia'] for v in votos) / n
+def get_db_connection():
+    """Retorna conexão com o banco"""
+    return sqlite3.connect(DATABASE_FILE)
+
+def gerar_id_problema(nome):
+    """Gera ID único para o problema"""
+    import hashlib
+    return hashlib.md5(nome.encode()).hexdigest()[:12]
+
+def adicionar_problema_db(nome, descricao=""):
+    """Adiciona problema no banco de dados"""
+    pid = gerar_id_problema(nome)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            INSERT OR REPLACE INTO problemas (id, nome, descricao, timestamp)
+            VALUES (?, ?, ?, ?)
+        ''', (pid, nome, descricao, timestamp))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao adicionar problema: {e}")
+        return False
+    finally:
+        conn.close()
+
+def listar_problemas_db():
+    """Lista todos os problemas do banco"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT id, nome, descricao, timestamp FROM problemas ORDER BY timestamp')
+    problemas = cursor.fetchall()
+    conn.close()
+    
+    return [{"id": p[0], "nome": p[1], "descricao": p[2], "timestamp": p[3]} for p in problemas]
+
+def remover_problema_db(problema_id):
+    """Remove problema e seus votos do banco"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Remove votos do problema
+        cursor.execute('DELETE FROM votos WHERE problema_id = ?', (problema_id,))
+        # Remove o problema
+        cursor.execute('DELETE FROM problemas WHERE id = ?', (problema_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao remover problema: {e}")
+        return False
+    finally:
+        conn.close()
+
+def votar_problema_db(problema_id, participante, gravidade, urgencia, tendencia):
+    """Registra ou atualiza voto no banco"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            INSERT OR REPLACE INTO votos 
+            (problema_id, participante, gravidade, urgencia, tendencia, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (problema_id, participante, gravidade, urgencia, tendencia, timestamp))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao registrar voto: {e}")
+        return False
+    finally:
+        conn.close()
+
+def obter_voto_participante_db(problema_id, participante):
+    """Obtém voto específico de um participante para um problema"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT gravidade, urgencia, tendencia FROM votos 
+        WHERE problema_id = ? AND participante = ?
+    ''', (problema_id, participante))
+    
+    voto = cursor.fetchone()
+    conn.close()
+    
+    if voto:
+        return {"gravidade": voto[0], "urgencia": voto[1], "tendencia": voto[2]}
+    return None
+
+def calcular_medias_db(problema_id):
+    """Calcula médias dos votos para um problema"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT COUNT(*), AVG(gravidade), AVG(urgencia), AVG(tendencia)
+        FROM votos WHERE problema_id = ?
+    ''', (problema_id,))
+    
+    resultado = cursor.fetchone()
+    conn.close()
+    
+    if resultado and resultado[0] > 0:
+        total, mg, mu, mt = resultado
+        return {
+            "total": int(total),
+            "mg": round(mg, 2),
+            "mu": round(mu, 2), 
+            "mt": round(mt, 2),
+            "gut": round(mg * mu * mt, 2)
+        }
+    return None
+
+def obter_estatisticas_db():
+    """Obtém estatísticas gerais do banco"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Total de problemas
+    cursor.execute('SELECT COUNT(*) FROM problemas')
+    total_problemas = cursor.fetchone()[0]
+    
+    # Total de votos
+    cursor.execute('SELECT COUNT(*) FROM votos')
+    total_votos = cursor.fetchone()[0]
+    
+    # Participantes únicos
+    cursor.execute('SELECT COUNT(DISTINCT participante) FROM votos')
+    participantes_unicos = cursor.fetchone()[0]
+    
+    conn.close()
+    
     return {
-        "total": n, 
-        "mg": round(g,2), 
-        "mu": round(u,2), 
-        "mt": round(t,2), 
-        "gut": round(g*u*t,2)
+        "problemas": total_problemas,
+        "votos": total_votos,
+        "participantes": participantes_unicos
     }
 
-def classificar_prioridade(p): 
-    return ("🔴 ALTA","priority-high") if p>=64 else ("🟡 MÉDIA","priority-medium") if p>=27 else ("🟢 BAIXA","priority-low")
+def resetar_banco_db():
+    """Reseta completamente o banco de dados"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('DELETE FROM votos')
+        cursor.execute('DELETE FROM problemas')
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao resetar banco: {e}")
+        return False
+    finally:
+        conn.close()
+
+def classificar_prioridade(pontuacao):
+    """Classifica prioridade baseada na pontuação GUT"""
+    return ("🔴 ALTA", "priority-high") if pontuacao >= 64 else ("🟡 MÉDIA", "priority-medium") if pontuacao >= 27 else ("🟢 BAIXA", "priority-low")
+
+# ===================== ESTADOS DE SESSÃO =====================
+if 'modo' not in st.session_state: 
+    st.session_state.modo = 'selecao'
+if 'participante_id' not in st.session_state: 
+    st.session_state.participante_id = None
+if 'admin_logado' not in st.session_state: 
+    st.session_state.admin_logado = False
+
+# Inicializar banco na primeira execução
+init_database()
 
 # ===================== TELAS =====================
 
 # ========== TELA SELEÇÃO ==========
 if st.session_state.modo == 'selecao':
-    st.markdown("""<div class="main-header"><h1>⚖️ Matriz GUT 2.0</h1><h3>Tribunal de Justiça de Rondônia</h3></div>""", unsafe_allow_html=True)
+    st.markdown("""<div class="main-header"><h1>⚖️ Matriz GUT 2.0</h1><h3>Tribunal de Justiça de Rondônia</h3><p>Sistema de Votação Colaborativa com Dados Compartilhados</p></div>""", unsafe_allow_html=True)
+    
+    # Mostrar estatísticas gerais
+    stats = obter_estatisticas_db()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📋 Problemas", stats["problemas"])
+    with col2:
+        st.metric("🗳️ Votos", stats["votos"])
+    with col3:
+        st.metric("👥 Participantes", stats["participantes"])
+    
+    st.markdown("---")
     
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("🔐 Administrador", use_container_width=True): 
-            st.session_state.modo='login_admin'
+            st.session_state.modo = 'login_admin'
             st.rerun()
     with col2:
         if st.button("👥 Participante", use_container_width=True): 
-            st.session_state.modo='login_participante'
+            st.session_state.modo = 'login_participante'
             st.rerun()
     with col3:
         if st.button("📊 Resultados", use_container_width=True): 
-            st.session_state.modo='resultados'
+            st.session_state.modo = 'resultados'
             st.rerun()
 
 # ========== LOGIN ADMIN ==========
@@ -168,11 +336,10 @@ elif st.session_state.modo == 'admin' and st.session_state.admin_logado:
             st.session_state.modo = 'selecao'
             st.rerun()
     with colB:
-        if st.button("🗑️ Reiniciar Oficina (Apagar Todos os Dados)", type="secondary"):
-            st.session_state.problemas_cadastrados = []
-            st.session_state.votos = {}
-            st.success("✅ Oficina reiniciada com sucesso!")
-            st.rerun()
+        if st.button("🗑️ Resetar Oficina (Apagar Todos os Dados)", type="secondary"):
+            if resetar_banco_db():
+                st.success("✅ Oficina resetada com sucesso!")
+                st.rerun()
     
     st.markdown("---")
     
@@ -183,9 +350,9 @@ elif st.session_state.modo == 'admin' and st.session_state.admin_logado:
     
     if st.button("Adicionar Problema", type="primary"):
         if nome.strip(): 
-            adicionar_problema_admin(nome.strip(), desc.strip())
-            st.success(f"✅ Problema '{nome}' cadastrado com sucesso!")
-            st.rerun()
+            if adicionar_problema_db(nome.strip(), desc.strip()):
+                st.success(f"✅ Problema '{nome}' cadastrado com sucesso!")
+                st.rerun()
         else:
             st.error("❌ Digite o nome do problema")
     
@@ -193,22 +360,26 @@ elif st.session_state.modo == 'admin' and st.session_state.admin_logado:
     
     # Lista de problemas cadastrados
     st.subheader("📋 Problemas Cadastrados")
+    problemas = listar_problemas_db()
     
-    if not st.session_state.problemas_cadastrados:
+    if not problemas:
         st.info("Nenhum problema cadastrado ainda.")
     else:
-        for i, p in enumerate(st.session_state.problemas_cadastrados):
-            with st.expander(f"📋 {p['nome']} ({len(st.session_state.votos.get(p['id'], []))} votos)"):
+        for i, p in enumerate(problemas):
+            # Contar votos para este problema
+            medias = calcular_medias_db(p['id'])
+            total_votos = medias['total'] if medias else 0
+            
+            with st.expander(f"📋 {p['nome']} ({total_votos} votos)"):
                 if p['descricao']:
                     st.write(f"**Descrição:** {p['descricao']}")
                 st.write(f"**Cadastrado em:** {p['timestamp']}")
+                st.write(f"**ID:** {p['id']}")
                 
                 if st.button("🗑️ Remover", key=f"rm{i}", type="secondary"): 
-                    st.session_state.problemas_cadastrados.pop(i)
-                    if p['id'] in st.session_state.votos:
-                        del st.session_state.votos[p['id']]
-                    st.success(f"✅ Problema '{p['nome']}' removido!")
-                    st.rerun()
+                    if remover_problema_db(p['id']):
+                        st.success(f"✅ Problema '{p['nome']}' removido!")
+                        st.rerun()
     
     st.markdown("---")
     
@@ -237,7 +408,7 @@ elif st.session_state.modo == 'login_participante':
             st.session_state.modo = 'selecao'
             st.rerun()
 
-# ========== TELA PARTICIPANTE (COM EXPLICAÇÃO GUT) ==========
+# ========== TELA PARTICIPANTE ==========
 elif st.session_state.modo == 'participante' and st.session_state.participante_id:
     st.markdown(f"""<div class="participant-header"><h2>🗳️ Votação - {st.session_state.participante_id}</h2></div>""", unsafe_allow_html=True)
     
@@ -303,16 +474,18 @@ elif st.session_state.modo == 'participante' and st.session_state.participante_i
         **🎯 Lembre-se**: Sua avaliação será combinada com a de outros participantes para gerar o resultado final!
         """)
     
-    if not st.session_state.problemas_cadastrados:
+    # Carregar problemas do banco
+    problemas = listar_problemas_db()
+    
+    if not problemas:
         st.warning("⚠️ Nenhum problema foi cadastrado ainda. Aguarde o administrador.")
     else:
         st.markdown("### 📋 Avalie cada problema nos critérios G-U-T:")
         st.markdown("*💡 Dica: Leia a explicação acima se tiver dúvidas sobre os critérios*")
         
-        for i, prob in enumerate(st.session_state.problemas_cadastrados, 1):
+        for i, prob in enumerate(problemas, 1):
             # Verificar se já votou neste problema
-            votos_problema = st.session_state.votos.get(prob['id'], [])
-            voto_existente = next((v for v in votos_problema if v['participante'] == st.session_state.participante_id), None)
+            voto_existente = obter_voto_participante_db(prob['id'], st.session_state.participante_id)
             
             # Card do problema
             st.markdown(f"""
@@ -363,9 +536,9 @@ elif st.session_state.modo == 'participante' and st.session_state.participante_i
                 texto_botao = "🔄 Atualizar Voto" if voto_existente else "✅ Confirmar Voto"
                 
                 if st.form_submit_button(texto_botao, type="primary"):
-                    votar_problema(prob['id'], st.session_state.participante_id, g, u, t)
-                    st.success(f"✅ Voto registrado para '{prob['nome']}'!")
-                    st.rerun()
+                    if votar_problema_db(prob['id'], st.session_state.participante_id, g, u, t):
+                        st.success(f"✅ Voto registrado para '{prob['nome']}'!")
+                        st.rerun()
             
             st.markdown("---")  # Separador entre problemas
     
@@ -395,10 +568,12 @@ elif st.session_state.modo == 'resultados':
         if st.button("🔃 Atualizar Resultados"): 
             st.rerun()
     
-    # Calcular resultados
+    # Carregar problemas e calcular resultados
+    problemas = listar_problemas_db()
     resultados = []
-    for p in st.session_state.problemas_cadastrados:
-        medias = calcular_medias(p['id'])
+    
+    for p in problemas:
+        medias = calcular_medias_db(p['id'])
         if medias: 
             resultados.append({
                 "Problema": p['nome'],
@@ -416,17 +591,14 @@ elif st.session_state.modo == 'resultados':
         df_resultados["Prioridade"] = df_resultados["Pontuação GUT"].apply(lambda x: classificar_prioridade(x)[0])
         
         # Estatísticas gerais
+        stats = obter_estatisticas_db()
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("📋 Problemas", len(df_resultados))
+            st.metric("📋 Problemas", stats["problemas"])
         with col2:
-            st.metric("🗳️ Total de Votos", df_resultados["Total Votos"].sum())
+            st.metric("🗳️ Total de Votos", stats["votos"])
         with col3:
-            participantes_unicos = set()
-            for votos_problema in st.session_state.votos.values():
-                for voto in votos_problema:
-                    participantes_unicos.add(voto['participante'])
-            st.metric("👥 Participantes", len(participantes_unicos))
+            st.metric("👥 Participantes", stats["participantes"])
         with col4:
             st.metric("🏆 Maior Pontuação", f"{df_resultados['Pontuação GUT'].max():.1f}")
         
